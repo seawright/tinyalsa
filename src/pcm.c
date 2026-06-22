@@ -300,13 +300,13 @@ struct pcm {
     int fd;
     /** Flags that were passed to @ref pcm_open */
     unsigned int flags;
-    /** The number of (under/over)runs that have occured */
+    /** The number of (under/over)runs that have occurred */
     int xruns;
     /** Size of the buffer */
     unsigned int buffer_size;
     /** The boundary for ring buffer pointers */
     unsigned long boundary;
-    /** Description of the last error that occured */
+    /** Description of the last error that occurred */
     char error[PCM_ERROR_MAX];
     /** Configuration that was passed to @ref pcm_open */
     struct pcm_config config;
@@ -409,10 +409,10 @@ int pcm_get_file_descriptor(const struct pcm *pcm)
     return pcm->fd;
 }
 
-/** Gets the error message for the last error that occured.
- * If no error occured and this function is called, the results are undefined.
+/** Gets the error message for the last error that occurred.
+ * If no error occurred and this function is called, the results are undefined.
  * @param pcm A PCM handle.
- * @return The error message of the last error that occured.
+ * @return The error message of the last error that occurred.
  * @ingroup libtinyalsa-pcm
  */
 const char* pcm_get_error(const struct pcm *pcm)
@@ -501,7 +501,10 @@ int pcm_set_config(struct pcm *pcm, const struct pcm_config *config)
     memset(&sparams, 0, sizeof(sparams));
     sparams.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;
     sparams.period_step = 1;
-    sparams.avail_min = config->period_size;
+    if (!pcm->config.avail_min) {
+        pcm->config.avail_min = pcm->config.period_size;
+    }
+    sparams.avail_min = pcm->config.avail_min;
 
     if (!config->start_threshold) {
         if (pcm->flags & PCM_IN)
@@ -650,6 +653,8 @@ static int pcm_hw_mmap_status(struct pcm *pcm)
         goto mmap_error;
     }
 
+    pcm->mmap_control->avail_min = pcm->config.avail_min;
+
     return 0;
 
 mmap_error:
@@ -659,6 +664,7 @@ mmap_error:
         return -ENOMEM;
     pcm->mmap_status = &pcm->sync_ptr->s.status;
     pcm->mmap_control = &pcm->sync_ptr->c.control;
+    pcm->mmap_control->avail_min = pcm->config.avail_min;
 
     return 0;
 }
@@ -1157,7 +1163,7 @@ int pcm_is_ready(const struct pcm *pcm)
  */
 int pcm_link(struct pcm *pcm1, struct pcm *pcm2)
 {
-    int err = ioctl(pcm1->fd, SNDRV_PCM_IOCTL_LINK, pcm2->fd);
+    int err = pcm1->ops->ioctl(pcm1->data, SNDRV_PCM_IOCTL_LINK, pcm2->fd);
     if (err == -1) {
         return oops(pcm1, errno, "cannot link PCM");
     }
@@ -1172,7 +1178,7 @@ int pcm_link(struct pcm *pcm1, struct pcm *pcm2)
  */
 int pcm_unlink(struct pcm *pcm)
 {
-    int err = ioctl(pcm->fd, SNDRV_PCM_IOCTL_UNLINK);
+    int err = pcm->ops->ioctl(pcm->data, SNDRV_PCM_IOCTL_UNLINK);
     if (err == -1) {
         return oops(pcm, errno, "cannot unlink PCM");
     }
@@ -1443,8 +1449,8 @@ again:
  * @param pcm A PCM handle.
  * @param timeout The maximum amount of time to wait for, in terms of milliseconds.
  * @returns If frames became available, one is returned.
- *  If a timeout occured, zero is returned.
- *  If an error occured, a negative number is returned.
+ *  If a timeout occurred, zero is returned.
+ *  If an error occurred, a negative number is returned.
  * @ingroup libtinyalsa-pcm
  */
 int pcm_wait(struct pcm *pcm, int timeout)
@@ -1533,18 +1539,25 @@ static int pcm_mmap_transfer(struct pcm *pcm, void *buffer, unsigned int frames)
     while (frames) {
         avail = pcm_mmap_avail(pcm);
 
-        if (!avail) {
+        if (avail < pcm->config.avail_min) {
+            int time = -1;
             if (pcm->flags & PCM_NONBLOCK) {
                 errno = EAGAIN;
                 break;
             }
-
-            /* wait for interrupt */
-            err = pcm_wait(pcm, -1);
+	    if (pcm->flags & PCM_NOIRQ) {
+                time = (pcm->config.avail_min - avail) / pcm->noirq_frames_per_msec;
+	        /* check the wait time and ensure it's at least 1ms */
+	        if (time < 1)
+		    time = 1;
+	    }
+            /* based on the type and available data, wait dynamically */
+            err = pcm_wait(pcm, time);
             if (err < 0) {
                 errno = -err;
                 break;
             }
+	    continue;
         }
 
         transferred_frames = pcm_mmap_transfer_areas(pcm, buffer, user_offset, frames);
@@ -1786,7 +1799,7 @@ int pcm_read(struct pcm *pcm, void *data, unsigned int count)
  */
 long pcm_get_delay(struct pcm *pcm)
 {
-    if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_DELAY, &pcm->pcm_delay) < 0)
+    if (pcm->ops->ioctl(pcm->data, SNDRV_PCM_IOCTL_DELAY, &pcm->pcm_delay) < 0)
         return -1;
 
     return pcm->pcm_delay;
@@ -1806,6 +1819,5 @@ int pcm_ioctl(struct pcm *pcm, int request, ...)
     arg = va_arg(ap, void *);
     va_end(ap);
 
-    // FIXME Does not handle plugins
-    return ioctl(pcm->fd, request, arg);
+    return pcm->ops->ioctl(pcm->data, request, arg);
 }
